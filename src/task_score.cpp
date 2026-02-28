@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #include "utils.h"
 #include "errorWindow.h"
@@ -86,6 +88,7 @@ struct CmdLineOptions
     bool verbose;
     bool debug;
     bool callRepeats;
+    int threads;
 };
 
 
@@ -143,14 +146,30 @@ void parseOptions(int argc, char** argv, CmdLineOptions& ops, map<short, ErrorWi
 
 void updateErrorList(list<Error>& l, Error& e);
 
-void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_map, list<pair<unsigned long, unsigned long > > &gaps, unsigned long seqLength, string& seqName, vector<float>& scores, vector<bool>& perfectCov, BAMdata& bamData);
+void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_map, list<pair<unsigned long, unsigned long > > &gaps, unsigned long seqLength, const string& seqName, vector<float>& scores, vector<bool>& perfectCov, BAMdata& bamData, ostream& score_out, ostream& gff_out_stream);
 
 void updateScoreHist(map<float, unsigned long>& hist, vector<float>& scores);
 
 
-void bam2possibleLink(CmdLineOptions& ops, string& refID, unsigned long start, unsigned long end, string& hitName, unsigned long& hitStart, unsigned long& hitEnd, BAMdata& bamData);
+void bam2possibleLink(CmdLineOptions& ops, const string& refID, unsigned long start, unsigned long end, string& hitName, unsigned long& hitStart, unsigned long& hitEnd, BAMdata& bamData);
 
-double region2meanScore(CmdLineOptions& ops, string& seqID, unsigned long start, unsigned long end, short column);
+double region2meanScore(CmdLineOptions& ops, const string& seqID, unsigned long start, unsigned long end, short column);
+
+struct ContigTask
+{
+    string name;
+    unsigned long length;
+    unsigned long index;
+    string scoreTmp;
+    string gffTmp;
+    string histTmp;
+};
+
+bool processContig(const ContigTask& task, CmdLineOptions& ops, const map<short, ErrorWindow>& baseWindows, const map<string, list<pair<unsigned long, unsigned long> > >& globalGaps);
+
+void appendFileToStream(const string& path, ostream& out);
+
+void mergeScoreHist(map<float, unsigned long>& hist, const string& path);
 
 
 
@@ -167,163 +186,289 @@ int main(int argc, char* argv[])
     string fout_breaks(options.outprefix + ".errors.gff");
     map<float, unsigned long>  scoreHist;
 
-    options.ofs_breaks.open(fout_breaks.c_str());
-
-    if (!options.ofs_breaks.good())
+    if (options.threads <= 1)
     {
-        cerr << ERROR_PREFIX << "Error opening '" << fout_breaks << "'" << endl;
-        exit(1);
-    }
+        options.ofs_breaks.open(fout_breaks.c_str());
 
-    unsigned long lastPos = 0;
-    vector<float> scores;
-    vector<bool> perfectCov;
-    BAMdata bamData;
-    Tabix ti(options.statsInfile);
-
-    // open bam file ready for when we look for links to other regions
-    if (!bamData.bamReader.Open(options.bamInfile))
-    {
-        cerr << ERROR_PREFIX << "Error opening bam file " << options.bamInfile << endl;
-        exit(1);
-    }
-
-    if (!bamData.bamReader.LocateIndex())
-    {
-        cerr << ERROR_PREFIX << "Couldn't find index for bam file '" << options.bamInfile << "'!" << endl;
-        exit(1);
-    }
-
-    if (!bamData.bamReader.HasIndex())
-    {
-        cerr << ERROR_PREFIX << "No index for bam file '" << options.bamInfile << "'!" << endl;
-        exit(1);
-    }
-
-    bamData.header = bamData.bamReader.GetHeader();
-    bamData.references = bamData.bamReader.GetReferenceData();
-
-    if (bamData.header.Sequences.Size() == 0)
-    {
-        cerr << ERROR_PREFIX << "Error reading header of BAM file.  Didn't find any sequences" << endl;
-        return(1);
-    }
-
-    while (ti.getNextLine(line))
-    {
-        if (line[0] == '#') continue;
-
-        float currentScore;
-        vector<string> data;
-        string tmp;
-        split(line, '\t', data);
-
-        if (options.verbose && lastPos % 100000 == 0)
+        if (!options.ofs_breaks.good())
         {
-            cerr << ERROR_PREFIX << "progress" << '\t' << data[CHR] << '\t' << lastPos << endl;
+            cerr << ERROR_PREFIX << "Error opening '" << fout_breaks << "'" << endl;
+            exit(1);
         }
 
-        if (data[CHR].compare(currentRefID))
+        unsigned long lastPos = 0;
+        vector<float> scores;
+        vector<bool> perfectCov;
+        BAMdata bamData;
+        Tabix ti(options.statsInfile);
+
+        // open bam file ready for when we look for links to other regions
+        if (!bamData.bamReader.Open(options.bamInfile))
         {
-            if (currentRefID.size() != 0)
+            cerr << ERROR_PREFIX << "Error opening bam file " << options.bamInfile << endl;
+            exit(1);
+        }
+
+        if (!bamData.bamReader.LocateIndex())
+        {
+            cerr << ERROR_PREFIX << "Couldn't find index for bam file '" << options.bamInfile << "'!" << endl;
+            exit(1);
+        }
+
+        if (!bamData.bamReader.HasIndex())
+        {
+            cerr << ERROR_PREFIX << "No index for bam file '" << options.bamInfile << "'!" << endl;
+            exit(1);
+        }
+
+        bamData.header = bamData.bamReader.GetHeader();
+        bamData.references = bamData.bamReader.GetReferenceData();
+
+        if (bamData.header.Sequences.Size() == 0)
+        {
+            cerr << ERROR_PREFIX << "Error reading header of BAM file.  Didn't find any sequences" << endl;
+            return(1);
+        }
+
+        while (ti.getNextLine(line))
+        {
+            if (line[0] == '#') continue;
+
+            float currentScore;
+            vector<string> data;
+            string tmp;
+            split(line, '\t', data);
+
+            if (options.verbose && lastPos % 100000 == 0)
             {
-                // just got to new ref ID, so need to print out stuff from last one
-                scoreAndFindBreaks(options, errors, globalGaps[currentRefID], lastPos, currentRefID, scores, perfectCov, bamData);
-                updateScoreHist(scoreHist, scores);
+                cerr << ERROR_PREFIX << "progress" << '\t' << data[CHR] << '\t' << lastPos << endl;
             }
 
-            currentRefID = data[CHR];
-            map<string, list<pair<unsigned long, unsigned long> > >::iterator p = globalGaps.find(currentRefID);
-            errors.clear();
-            scores.clear();
-            perfectCov.clear();
+            if (data[CHR].compare(currentRefID))
+            {
+                if (currentRefID.size() != 0)
+                {
+                    // just got to new ref ID, so need to print out stuff from last one
+                    scoreAndFindBreaks(options, errors, globalGaps[currentRefID], lastPos, currentRefID, scores, perfectCov, bamData, cout, options.ofs_breaks);
+                    updateScoreHist(scoreHist, scores);
+                }
 
+                currentRefID = data[CHR];
+                map<string, list<pair<unsigned long, unsigned long> > >::iterator p = globalGaps.find(currentRefID);
+                errors.clear();
+                scores.clear();
+                perfectCov.clear();
+
+                for (map<short, ErrorWindow>::iterator p = windows.begin(); p != windows.end(); p++)
+                {
+                    p->second.clear(atoi(data[POS].c_str()));
+                }
+            }
+
+            // update perfect cov
+            if (options.usePerfect)
+            {
+                if (atoi(data[PERFECT_COV].c_str()) > 0)
+                {
+                    perfectCov.push_back(true);
+                }
+                else
+                {
+                    perfectCov.push_back(false);
+                }
+            }
+
+
+            // update the windows
             for (map<short, ErrorWindow>::iterator p = windows.begin(); p != windows.end(); p++)
             {
-                p->second.clear(atoi(data[POS].c_str()));
+                if (p->second.fail())
+                {
+                    Error tmp;
+                    tmp.start = p->second.start();
+                    tmp.end = p->second.end();
+                    tmp.type = p->first;
+                    updateErrorList(errors[p->first], tmp);
+                }
+
+                if (p->first == READ_COV)
+                {
+                    p->second.add( atoi(data[POS].c_str()), atoi(data[READ_F].c_str()) + atoi(data[READ_R].c_str()) );
+                }
+                else
+                {
+                    p->second.add(atoi(data[POS].c_str()),  atof(data[p->first].c_str()) );
+                }
             }
+
+            // update the score
+            currentScore = (options.usePerfect && windows[PERFECT_COV].lastFail()) ? 1 : 0;
+            currentScore += windows[FCD_ERR].lastFail() ? 1 : 0;
+
+            if (!options.perfectWins || currentScore)
+            {
+                currentScore += windows[READ_F].lastFail() ? 0.5 : 0;
+                currentScore += windows[READ_R].lastFail() ? 0.5 : 0;
+                currentScore += windows[READ_PROP_F].lastFail() ? 0.5 : 0;
+                currentScore += windows[READ_PROP_R].lastFail() ? 0.5 : 0;
+                //currentScore += windows[FCD_ERR].lastFail() ? 1 : 0;
+            }
+
+            // Even if we have perfect coverage, could still have a collapsed repeat
+            if (options.callRepeats)
+            {
+                currentScore += windows[FRAG_COV_CORRECT].lastFail() ? 1 : 0;
+            }
+
+            // too much soft clipping?
+            unsigned long depthFwd = atoi(data[READ_F].c_str());
+            unsigned long depthRev = atoi(data[READ_R].c_str());
+            bool fl = depthFwd && atof(data[CLIP_FL].c_str()) / depthFwd >= options.clipCutoff;
+            bool fr = depthFwd && atof(data[CLIP_FR].c_str()) / depthFwd >= options.clipCutoff;
+            bool rl = depthRev && atof(data[CLIP_RL].c_str()) / depthRev >= options.clipCutoff;
+            bool rr = depthRev && atof(data[CLIP_RR].c_str()) / depthRev >= options.clipCutoff;
+
+            if ((fl && rl) || (fr && rr))
+            {
+                Error err;
+                err.start = err.end = atoi(data[POS].c_str());
+                err.type = CLIP_FAIL;
+                updateErrorList(errors[CLIP_FAIL], err);
+                if (!options.perfectWins || (options.usePerfect && windows[PERFECT_COV].lastFail())) currentScore++;
+            }
+
+            scores.push_back(1.0 * currentScore / options.scoreDivider);
+            lastPos = atoi(data[POS].c_str());
         }
 
-        // update perfect cov
-        if (options.usePerfect)
+        // sort out the final chromosome from the input stats
+        scoreAndFindBreaks(options, errors, globalGaps[currentRefID], lastPos, currentRefID, scores, perfectCov, bamData, cout, options.ofs_breaks);
+        updateScoreHist(scoreHist, scores);
+        options.ofs_breaks.close();
+    }
+    else
+    {
+        // Parallel mode: fork worker processes per contig
+        BAMdata bamData;
+        if (!bamData.bamReader.Open(options.bamInfile))
         {
-            if (atoi(data[PERFECT_COV].c_str()) > 0)
+            cerr << ERROR_PREFIX << "Error opening bam file " << options.bamInfile << endl;
+            exit(1);
+        }
+
+        if (!bamData.bamReader.LocateIndex())
+        {
+            cerr << ERROR_PREFIX << "Couldn't find index for bam file '" << options.bamInfile << "'!" << endl;
+            exit(1);
+        }
+
+        if (!bamData.bamReader.HasIndex())
+        {
+            cerr << ERROR_PREFIX << "No index for bam file '" << options.bamInfile << "'!" << endl;
+            exit(1);
+        }
+
+        bamData.header = bamData.bamReader.GetHeader();
+        bamData.references = bamData.bamReader.GetReferenceData();
+
+        if (bamData.header.Sequences.Size() == 0)
+        {
+            cerr << ERROR_PREFIX << "Error reading header of BAM file.  Didn't find any sequences" << endl;
+            return(1);
+        }
+
+        bamData.bamReader.Close();
+
+        vector<ContigTask> tasks;
+        unsigned long taskIndex = 0;
+        for (unsigned int i = 0; i < bamData.references.size(); i++)
+        {
+            if (bamData.references[i].RefLength == 0)
             {
-                perfectCov.push_back(true);
+                continue;
+            }
+            ContigTask task;
+            task.name = bamData.references[i].RefName;
+            task.length = bamData.references[i].RefLength;
+            task.index = taskIndex++;
+            task.scoreTmp = options.outprefix + ".scores.tmp." + toString(task.index);
+            task.gffTmp = options.outprefix + ".errors.tmp." + toString(task.index);
+            task.histTmp = options.outprefix + ".score_hist.tmp." + toString(task.index);
+            tasks.push_back(task);
+        }
+
+        vector<pid_t> running;
+        map<pid_t, unsigned long> pidToTask;
+
+        for (unsigned long i = 0; i < tasks.size(); i++)
+        {
+            while ((int)running.size() >= options.threads)
+            {
+                int status = 0;
+                pid_t done = waitpid(-1, &status, 0);
+                if (done > 0)
+                {
+                    running.erase(remove(running.begin(), running.end(), done), running.end());
+                    if (status != 0)
+                    {
+                        cerr << ERROR_PREFIX << "Child process failed while processing contig index " << pidToTask[done] << endl;
+                        exit(1);
+                    }
+                }
+            }
+
+            pid_t pid = fork();
+            if (pid == 0)
+            {
+                bool ok = processContig(tasks[i], options, windows, globalGaps);
+                exit(ok ? 0 : 1);
+            }
+            else if (pid > 0)
+            {
+                running.push_back(pid);
+                pidToTask[pid] = tasks[i].index;
             }
             else
             {
-                perfectCov.push_back(false);
+                cerr << ERROR_PREFIX << "Error forking process" << endl;
+                exit(1);
             }
         }
 
-
-        // update the windows
-        for (map<short, ErrorWindow>::iterator p = windows.begin(); p != windows.end(); p++)
+        // wait for all children
+        for (unsigned long i = 0; i < running.size(); i++)
         {
-            if (p->second.fail())
+            int status = 0;
+            pid_t done = waitpid(running[i], &status, 0);
+            if (done > 0 && status != 0)
             {
-                Error tmp;
-                tmp.start = p->second.start();
-                tmp.end = p->second.end();
-                tmp.type = p->first;
-                updateErrorList(errors[p->first], tmp);
-            }
-
-            if (p->first == READ_COV)
-            {
-                p->second.add( atoi(data[POS].c_str()), atoi(data[READ_F].c_str()) + atoi(data[READ_R].c_str()) );
-            }
-            else
-            {
-                p->second.add(atoi(data[POS].c_str()),  atof(data[p->first].c_str()) );
+                cerr << ERROR_PREFIX << "Child process failed while processing contig index " << pidToTask[done] << endl;
+                exit(1);
             }
         }
 
-        // update the score
-        currentScore = (options.usePerfect && windows[PERFECT_COV].lastFail()) ? 1 : 0;
-        currentScore += windows[FCD_ERR].lastFail() ? 1 : 0;
-
-        if (!options.perfectWins || currentScore)
+        // merge outputs in contig order
+        options.ofs_breaks.open(fout_breaks.c_str());
+        if (!options.ofs_breaks.good())
         {
-            currentScore += windows[READ_F].lastFail() ? 0.5 : 0;
-            currentScore += windows[READ_R].lastFail() ? 0.5 : 0;
-            currentScore += windows[READ_PROP_F].lastFail() ? 0.5 : 0;
-            currentScore += windows[READ_PROP_R].lastFail() ? 0.5 : 0;
-            //currentScore += windows[FCD_ERR].lastFail() ? 1 : 0;
+            cerr << ERROR_PREFIX << "Error opening '" << fout_breaks << "'" << endl;
+            exit(1);
         }
 
-        // Even if we have perfect coverage, could still have a collapsed repeat
-        if (options.callRepeats)
+        for (unsigned long i = 0; i < tasks.size(); i++)
         {
-            currentScore += windows[FRAG_COV_CORRECT].lastFail() ? 1 : 0;
+            appendFileToStream(tasks[i].gffTmp, options.ofs_breaks);
+            appendFileToStream(tasks[i].scoreTmp, cout);
+            mergeScoreHist(scoreHist, tasks[i].histTmp);
+
+            remove(tasks[i].gffTmp.c_str());
+            remove(tasks[i].scoreTmp.c_str());
+            remove(tasks[i].histTmp.c_str());
         }
 
-        // too much soft clipping?
-        unsigned long depthFwd = atoi(data[READ_F].c_str());
-        unsigned long depthRev = atoi(data[READ_R].c_str());
-        bool fl = depthFwd && atof(data[CLIP_FL].c_str()) / depthFwd >= options.clipCutoff;
-        bool fr = depthFwd && atof(data[CLIP_FR].c_str()) / depthFwd >= options.clipCutoff;
-        bool rl = depthRev && atof(data[CLIP_RL].c_str()) / depthRev >= options.clipCutoff;
-        bool rr = depthRev && atof(data[CLIP_RR].c_str()) / depthRev >= options.clipCutoff;
-
-        if ((fl && rl) || (fr && rr))
-        {
-            Error err;
-            err.start = err.end = atoi(data[POS].c_str());
-            err.type = CLIP_FAIL;
-            updateErrorList(errors[CLIP_FAIL], err);
-            if (!options.perfectWins || (options.usePerfect && windows[PERFECT_COV].lastFail())) currentScore++;
-        }
-
-        scores.push_back(1.0 * currentScore / options.scoreDivider);
-        lastPos = atoi(data[POS].c_str());
+        options.ofs_breaks.close();
     }
 
-    // sort out the final chromosome from the input stats
-    scoreAndFindBreaks(options, errors, globalGaps[currentRefID], lastPos, currentRefID, scores, perfectCov, bamData);
-    updateScoreHist(scoreHist, scores);
-    options.ofs_breaks.close();
     string scoreHistFile(options.outprefix + ".score_histogram.dat");
     ofstream ofsScore(scoreHistFile.c_str());
     if (!ofsScore.good())
@@ -369,7 +514,8 @@ Options:\n\n\
 \tUse -R 0 to not call repeats [2]\n\
 -s <int>\n\tMin score to report in errors file [0.4]\n\
 -u <int>\n\tFCD error window length for error calling [insert_size / 2]\n\
--w <float>\n\tMin \% of bases in window needed to call as bad [0.8]\n\n\
+-w <float>\n\tMin \% of bases in window needed to call as bad [0.8]\n\
+-t <int>\n\tNumber of parallel processes [1]\n\n\
 ";
 
     if (argc == 2 && strcmp(argv[1], "--wrapperhelp") == 0)
@@ -467,6 +613,7 @@ Options:\n\n\
     ops.callRepeats = true;
     ops.debug = false;
     ops.maxFragCorrectCov = 2;
+    ops.threads = 1;
 
     for (i = 1; i < argc - requiredArgs; i++)
     {
@@ -539,6 +686,11 @@ Options:\n\n\
         else if (strcmp(argv[i], "-w") == 0)
         {
             ops.windowPercent = atof(argv[i+1]);
+        }
+        else if (strcmp(argv[i], "-t") == 0)
+        {
+            ops.threads = atoi(argv[i+1]);
+            if (ops.threads < 1) ops.threads = 1;
         }
         else
         {
@@ -636,6 +788,229 @@ Options:\n\n\
 }
 
 
+bool processContig(const ContigTask& task, CmdLineOptions& ops, const map<short, ErrorWindow>& baseWindows, const map<string, list<pair<unsigned long, unsigned long> > >& globalGaps)
+{
+    ofstream scoreOut(task.scoreTmp.c_str());
+    if (!scoreOut.good())
+    {
+        cerr << ERROR_PREFIX << "Error opening '" << task.scoreTmp << "'" << endl;
+        return false;
+    }
+
+    ofstream gffOut(task.gffTmp.c_str());
+    if (!gffOut.good())
+    {
+        cerr << ERROR_PREFIX << "Error opening '" << task.gffTmp << "'" << endl;
+        return false;
+    }
+
+    map<float, unsigned long> scoreHist;
+    map<short, ErrorWindow> windows = baseWindows;
+    map<short, list<Error> > errors;
+    vector<float> scores;
+    vector<bool> perfectCov;
+    unsigned long lastPos = 0;
+    bool started = false;
+
+    Tabix ti(ops.statsInfile);
+    string region = task.name + ":1-" + toString(task.length);
+    if (!ti.setRegion(region))
+    {
+        if (ops.verbose)
+        {
+            cerr << ERROR_PREFIX << "No stats entries found for " << task.name << endl;
+        }
+        ofstream histOut(task.histTmp.c_str());
+        return true;
+    }
+
+    string line;
+    while (ti.getNextLine(line))
+    {
+        if (line.empty() || line[0] == '#') continue;
+
+        float currentScore;
+        vector<string> data;
+        split(line, '\t', data);
+
+        if (!started)
+        {
+            for (map<short, ErrorWindow>::iterator p = windows.begin(); p != windows.end(); p++)
+            {
+                p->second.clear(atoi(data[POS].c_str()));
+            }
+            started = true;
+        }
+
+        // update perfect cov
+        if (ops.usePerfect)
+        {
+            if (atoi(data[PERFECT_COV].c_str()) > 0)
+            {
+                perfectCov.push_back(true);
+            }
+            else
+            {
+                perfectCov.push_back(false);
+            }
+        }
+
+        // update the windows
+        for (map<short, ErrorWindow>::iterator p = windows.begin(); p != windows.end(); p++)
+        {
+            if (p->second.fail())
+            {
+                Error tmp;
+                tmp.start = p->second.start();
+                tmp.end = p->second.end();
+                tmp.type = p->first;
+                updateErrorList(errors[p->first], tmp);
+            }
+
+            if (p->first == READ_COV)
+            {
+                p->second.add( atoi(data[POS].c_str()), atoi(data[READ_F].c_str()) + atoi(data[READ_R].c_str()) );
+            }
+            else
+            {
+                p->second.add(atoi(data[POS].c_str()),  atof(data[p->first].c_str()) );
+            }
+        }
+
+        // update the score
+        currentScore = (ops.usePerfect && windows[PERFECT_COV].lastFail()) ? 1 : 0;
+        currentScore += windows[FCD_ERR].lastFail() ? 1 : 0;
+
+        if (!ops.perfectWins || currentScore)
+        {
+            currentScore += windows[READ_F].lastFail() ? 0.5 : 0;
+            currentScore += windows[READ_R].lastFail() ? 0.5 : 0;
+            currentScore += windows[READ_PROP_F].lastFail() ? 0.5 : 0;
+            currentScore += windows[READ_PROP_R].lastFail() ? 0.5 : 0;
+        }
+
+        // Even if we have perfect coverage, could still have a collapsed repeat
+        if (ops.callRepeats)
+        {
+            currentScore += windows[FRAG_COV_CORRECT].lastFail() ? 1 : 0;
+        }
+
+        // too much soft clipping?
+        unsigned long depthFwd = atoi(data[READ_F].c_str());
+        unsigned long depthRev = atoi(data[READ_R].c_str());
+        bool fl = depthFwd && atof(data[CLIP_FL].c_str()) / depthFwd >= ops.clipCutoff;
+        bool fr = depthFwd && atof(data[CLIP_FR].c_str()) / depthFwd >= ops.clipCutoff;
+        bool rl = depthRev && atof(data[CLIP_RL].c_str()) / depthRev >= ops.clipCutoff;
+        bool rr = depthRev && atof(data[CLIP_RR].c_str()) / depthRev >= ops.clipCutoff;
+
+        if ((fl && rl) || (fr && rr))
+        {
+            Error err;
+            err.start = err.end = atoi(data[POS].c_str());
+            err.type = CLIP_FAIL;
+            updateErrorList(errors[CLIP_FAIL], err);
+            if (!ops.perfectWins || (ops.usePerfect && windows[PERFECT_COV].lastFail())) currentScore++;
+        }
+
+        scores.push_back(1.0 * currentScore / ops.scoreDivider);
+        lastPos = atoi(data[POS].c_str());
+    }
+
+    if (!started)
+    {
+        ofstream histOut(task.histTmp.c_str());
+        return true;
+    }
+
+    BAMdata bamData;
+    if (!bamData.bamReader.Open(ops.bamInfile))
+    {
+        cerr << ERROR_PREFIX << "Error opening bam file " << ops.bamInfile << endl;
+        return false;
+    }
+
+    if (!bamData.bamReader.LocateIndex())
+    {
+        cerr << ERROR_PREFIX << "Couldn't find index for bam file '" << ops.bamInfile << "'!" << endl;
+        return false;
+    }
+
+    if (!bamData.bamReader.HasIndex())
+    {
+        cerr << ERROR_PREFIX << "No index for bam file '" << ops.bamInfile << "'!" << endl;
+        return false;
+    }
+
+    bamData.header = bamData.bamReader.GetHeader();
+    bamData.references = bamData.bamReader.GetReferenceData();
+
+    if (bamData.header.Sequences.Size() == 0)
+    {
+        cerr << ERROR_PREFIX << "Error reading header of BAM file.  Didn't find any sequences" << endl;
+        return false;
+    }
+
+    list<pair<unsigned long, unsigned long> > gaps;
+    map<string, list<pair<unsigned long, unsigned long> > >::const_iterator g = globalGaps.find(task.name);
+    if (g != globalGaps.end())
+    {
+        gaps = g->second;
+    }
+
+    scoreAndFindBreaks(ops, errors, gaps, lastPos, task.name, scores, perfectCov, bamData, scoreOut, gffOut);
+    updateScoreHist(scoreHist, scores);
+
+    ofstream histOut(task.histTmp.c_str());
+    if (!histOut.good())
+    {
+        cerr << ERROR_PREFIX << "Error opening '" << task.histTmp << "'" << endl;
+        return false;
+    }
+
+    for (map<float, unsigned long>::iterator i = scoreHist.begin(); i != scoreHist.end(); i++)
+    {
+        histOut << i->first << '\t' << i->second << endl;
+    }
+
+    return true;
+}
+
+
+void appendFileToStream(const string& path, ostream& out)
+{
+    ifstream in(path.c_str());
+    if (!in.good())
+    {
+        cerr << ERROR_PREFIX << "Error opening '" << path << "'" << endl;
+        exit(1);
+    }
+    out << in.rdbuf();
+}
+
+
+void mergeScoreHist(map<float, unsigned long>& hist, const string& path)
+{
+    ifstream in(path.c_str());
+    if (!in.good())
+    {
+        cerr << ERROR_PREFIX << "Error opening '" << path << "'" << endl;
+        exit(1);
+    }
+
+    string line;
+    while (getline(in, line))
+    {
+        if (line.empty()) continue;
+        vector<string> data;
+        split(line, '\t', data);
+        if (data.size() < 2) continue;
+        float key = atof(data[0].c_str());
+        unsigned long val = atol(data[1].c_str());
+        hist[key] += val;
+    }
+}
+
+
 void updateErrorList(list<Error>& l, Error& e)
 {
     if (l.empty())
@@ -656,7 +1031,7 @@ void updateErrorList(list<Error>& l, Error& e)
 }
 
 
-void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_map, list<pair<unsigned long, unsigned long > > &gaps, unsigned long seqLength, string& seqName, vector<float>& scores, vector<bool>& perfectCov, BAMdata& bamData)
+void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_map, list<pair<unsigned long, unsigned long > > &gaps, unsigned long seqLength, const string& seqName, vector<float>& scores, vector<bool>& perfectCov, BAMdata& bamData, ostream& score_out, ostream& gff_out_stream)
 {
     if (ops.verbose)
     {
@@ -664,14 +1039,14 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
     }
 
     unsigned long scoreIndex = 0;
-    map<unsigned long, string> gff_out;  // start position -> gff line
+    map<unsigned long, string> gff_lines;  // start position -> gff line
 
     // Pull out all the regions of high fragment coverage
     if (ops.callRepeats)
     {
         for (list<Error>::iterator p = errors_map[FRAG_COV_CORRECT].begin(); p != errors_map[FRAG_COV_CORRECT].end(); p++)
         {
-            gff_out[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tRepeat\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start, p->end, FRAG_COV_CORRECT)) + "\t.\t.\tNote=Warning: Collapsed repeat;colour=6\n";
+            gff_lines[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tRepeat\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start, p->end, FRAG_COV_CORRECT)) + "\t.\t.\tNote=Warning: Collapsed repeat;colour=6\n";
         }
 
         errors_map.erase(FRAG_COV_CORRECT);
@@ -688,7 +1063,7 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
             gapsIter++;
         }
         if (clipIter->start >= 10 && clipIter->start + 10 < seqLength && (gapsIter == gaps.end() || clipIter->start + gapLimit < gapsIter->first)) {
-            gff_out[clipIter->start] += seqName + "\t" + TOOL_NAME + "\tClip\t" + toString(clipIter->start) + '\t' + toString(clipIter->end) + "\t.\t.\t.\tNote=Warning: Soft clip failure;colour=7\n";
+            gff_lines[clipIter->start] += seqName + "\t" + TOOL_NAME + "\tClip\t" + toString(clipIter->start) + '\t' + toString(clipIter->end) + "\t.\t.\t.\tNote=Warning: Soft clip failure;colour=7\n";
         }
     }
 
@@ -705,7 +1080,7 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
             gapsIter++;
         }
         if (gapsIter == gaps.end() || readIter->end < gapsIter->first) {
-            gff_out[readIter->start + 1] += seqName + "\t" + TOOL_NAME + "\tRead_cov\t" + toString(readIter->start + 1) + '\t' + toString(readIter->end + 1) + "\t.\t.\t.\tNote=Warning: Low read coverage;colour=8\n";
+            gff_lines[readIter->start + 1] += seqName + "\t" + TOOL_NAME + "\tRead_cov\t" + toString(readIter->start + 1) + '\t' + toString(readIter->end + 1) + "\t.\t.\t.\tNote=Warning: Low read coverage;colour=8\n";
         }
     }
     errors_map.erase(READ_COV);
@@ -722,7 +1097,7 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
                 gapsIter++;
             }
             if (gapsIter == gaps.end() || perfIter->end < gapsIter->first) {
-                gff_out[perfIter->start + 1] += seqName + "\t" + TOOL_NAME + "\tPerfect_cov\t" + toString(perfIter->start + 1) + '\t' + toString(perfIter->end + 1) + "\t.\t.\t.\tNote=Warning: Low perfect unique coverage;colour=9\n";
+                gff_lines[perfIter->start + 1] += seqName + "\t" + TOOL_NAME + "\tPerfect_cov\t" + toString(perfIter->start + 1) + '\t' + toString(perfIter->end + 1) + "\t.\t.\t.\tNote=Warning: Low perfect unique coverage;colour=9\n";
             }
         }
         errors_map.erase(PERFECT_COV);
@@ -766,7 +1141,7 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
         {
             maxScore = max(scores[i], maxScore);
         }
-        gff_out[p->start + 1] += seqName + '\t' + TOOL_NAME + "\tLow_score\t" + toString(p->start + 1) + '\t' + toString(p->end + 1) + '\t' + toString(1 - maxScore) + "\t.\t.\tNote=Warning: Low score;colour=10\n";
+        gff_lines[p->start + 1] += seqName + '\t' + TOOL_NAME + "\tLow_score\t" + toString(p->start + 1) + '\t' + toString(p->end + 1) + '\t' + toString(1 - maxScore) + "\t.\t.\tNote=Warning: Low score;colour=10\n";
     }
 
     scoreWindow.clear(1);
@@ -822,11 +1197,11 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
         bam2possibleLink(ops, seqName, p->first, p->second, hitName, hitStart, hitEnd, bamData);
         if (hitName.size() && !(hitName.compare(seqName) == 0 && p->first <= hitEnd + ops.maxInsert && hitStart <= p->second + ops.maxInsert))
         {
-            gff_out[p->first + 1] += seqName + "\t" + TOOL_NAME + "\tLink\t" + toString(p->first + 1) + '\t' + toString(p->second + 1) + "\t.\t.\t.\tNote=Warning: Link " + hitName + ":" + toString(hitStart+1) + "-" + toString(hitEnd+1)  + ";colour=11\n";
+            gff_lines[p->first + 1] += seqName + "\t" + TOOL_NAME + "\tLink\t" + toString(p->first + 1) + '\t' + toString(p->second + 1) + "\t.\t.\t.\tNote=Warning: Link " + hitName + ":" + toString(hitStart+1) + "-" + toString(hitEnd+1)  + ";colour=11\n";
         }
         else if (p->first > ops.outerInsertSize && p->second + ops.outerInsertSize < seqLength)
         {
-            gff_out[p->first + 1] += seqName + "\t" + TOOL_NAME + "\tRead_orientation\t" + toString(p->first + 1) + '\t' + toString(p->second + 1)  + "\t.\t.\t.\tNote=Warning: Bad read orientation;colour=1\n";
+            gff_lines[p->first + 1] += seqName + "\t" + TOOL_NAME + "\tRead_orientation\t" + toString(p->first + 1) + '\t' + toString(p->second + 1)  + "\t.\t.\t.\tNote=Warning: Bad read orientation;colour=1\n";
         }
     }
 
@@ -898,7 +1273,7 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
         // if overlaps a gap that is short enough
         if (gapIter != gaps.end() && gapIter->first <= p->end && gapIter->second - gapIter->first + 1 <= ops.maxGap)
         {
-            gff_out[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tFrag_cov_gap\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start + 1, p->end + 1, FRAG_COV)) +  "\t.\t.\tNote=Error: Fragment coverage too low over gap " + getNearbyGaps(p, gaps, gapIter)  + ";colour=12\n";
+            gff_lines[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tFrag_cov_gap\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start + 1, p->end + 1, FRAG_COV)) +  "\t.\t.\tNote=Error: Fragment coverage too low over gap " + getNearbyGaps(p, gaps, gapIter)  + ";colour=12\n";
             if (p->start < gapExtra)
             {
                 lowFragCovGaps.push_back(make_pair(0, p->end + gapExtra));
@@ -911,7 +1286,7 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
         // if this error doesn't overlap a gap and is not too near a large gap
         else if ( (gapIter == gaps.end() || gapIter->first > p->end) && (gapFlankIter == longGapFlanks.end() || gapFlankIter->first > p->end) )
         {
-            gff_out[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tFrag_cov\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start + 1, p->end + 1, FRAG_COV)) + "\t.\t.\tNote=Error: Fragment coverage too low;color=15\n";
+            gff_lines[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tFrag_cov\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start + 1, p->end + 1, FRAG_COV)) + "\t.\t.\tNote=Error: Fragment coverage too low;color=15\n";
         }
     }
 
@@ -942,12 +1317,12 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
         // if overlaps a gap that is short enough
         if (gapIter != gaps.end() && gapIter->first <= p->end && gapIter->second - gapIter->first + 1 <= ops.maxGap)
         {
-            gff_out[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tFCD_gap\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start + 1, p->end + 1, FCD_ERR)) +  "\t.\t.\tNote=Error: FCD failure over gap " + getNearbyGaps(p, gaps, gapIter) + ";colour=16\n";
+            gff_lines[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tFCD_gap\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start + 1, p->end + 1, FCD_ERR)) +  "\t.\t.\tNote=Error: FCD failure over gap " + getNearbyGaps(p, gaps, gapIter) + ";colour=16\n";
         }
         // if this error doesn't overlap a gap and is not too near a large gap
         else if ( (gapIter == gaps.end() || gapIter->first > p->end)  && (gapFlankIter == longGapFlanks.end() || gapFlankIter->first > p->end) )
         {
-            gff_out[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tFCD\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start + 1, p->end + 1, FCD_ERR)) + "\t.\t.\tNote=Error: FCD failure;colour=17\n";
+            gff_lines[p->start + 1] += seqName + "\t" + TOOL_NAME + "\tFCD\t" + toString(p->start + 1) + "\t" + toString(p->end + 1) + "\t" + toString(region2meanScore(ops, seqName, p->start + 1, p->end + 1, FCD_ERR)) + "\t.\t.\tNote=Error: FCD failure;colour=17\n";
         }
     }
 
@@ -955,16 +1330,16 @@ void scoreAndFindBreaks(CmdLineOptions& ops, map<short, list<Error> >& errors_ma
     while (scoreIndex < scores.size())
     {
         double s = scores[scoreIndex] == -1 ? -1 : 1 - scores[scoreIndex];
-        cout << seqName << '\t' << scoreIndex + 1 << '\t' << s << '\n';
+        score_out << seqName << '\t' << scoreIndex + 1 << '\t' << s << '\n';
         scoreIndex++;
     }
 
     // write the gff lines
-    for(map<unsigned long, string>::iterator p = gff_out.begin(); p != gff_out.end(); p++)
+    for(map<unsigned long, string>::iterator p = gff_lines.begin(); p != gff_lines.end(); p++)
     {
-        ops.ofs_breaks << p->second;
+        gff_out_stream << p->second;
     }
-    ops.ofs_breaks.flush();
+    gff_out_stream.flush();
 }
 
 
@@ -983,7 +1358,7 @@ bool compareErrors(const Error& e, const Error& f)
 }
 
 
-void bam2possibleLink(CmdLineOptions& ops, string& refID, unsigned long start, unsigned long end, string& hitName, unsigned long& hitStart, unsigned long& hitEnd, BAMdata& bamData)
+void bam2possibleLink(CmdLineOptions& ops, const string& refID, unsigned long start, unsigned long end, string& hitName, unsigned long& hitStart, unsigned long& hitEnd, BAMdata& bamData)
 {
     BamAlignment bamAlign;
     map<string, list<unsigned long> > hitPositions;
@@ -1086,7 +1461,7 @@ void bam2possibleLink(CmdLineOptions& ops, string& refID, unsigned long start, u
     }
 }
 
-double region2meanScore(CmdLineOptions& ops, string& seqID, unsigned long start, unsigned long end, short column)
+double region2meanScore(CmdLineOptions& ops, const string& seqID, unsigned long start, unsigned long end, short column)
 {
     Tabix tbx(ops.statsInfile);
     double total = 0;

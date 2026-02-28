@@ -82,8 +82,7 @@ if ($#ARGV == 3) {
 # make a bash script that runs all the pipeline commands
 my %commands;
 $commands{facheck} = "$reapr facheck $ref";
-$commands{preprocess} = "$reapr preprocess $ref $bam $dir\n"
-. "cd $dir";
+$commands{preprocess} = "$reapr preprocess $ref $bam $dir";
 
 if ($perfect_prefix) {
     $commands{stats} = "$reapr stats " . hash_to_ops($options{stats}) . " -p $perfect_prefix.perfect_cov.gz ./ $stats_prefix";
@@ -111,13 +110,74 @@ $commands{summary} = "$reapr summary 00.assembly.fa $score_prefix $break_prefix 
 
 open F, ">$bash_script" or die "$ERROR_PREFIX Error opening file for writing '$bash_script'";
 print F "set -e\n"
+. "file_ok(){ [ -s \"\$1\" ]; }\n"
+. "tbi_ok(){ file_ok \"\$1\" && file_ok \"\$1.tbi\"; }\n"
 . "echo \"Running reapr version $version pipeline:\"\n"
 . "echo \"$reapr " . join(' ', @ARGV) . "\"\n\n";
 
-for my $task (qw/facheck preprocess stats fcdrate score break summary/) {
-    print F "echo \"$ERROR_PREFIX Running $task\"\n"
-        . "$commands{$task}\n\n";
+# facheck (cheap; always run)
+print F "echo \"$ERROR_PREFIX Running facheck\"\n"
+    . "$commands{facheck}\n\n";
+
+# preprocess (skip if output dir already populated)
+print F "if [ -d \"$dir\" ]; then\n"
+    . "  if file_ok \"$dir/00.assembly.fa.gaps.gz\" && file_ok \"$dir/00.in.bam\" && file_ok \"$dir/00.Sample/insert.stats.txt\"; then\n"
+    . "    echo \"$ERROR_PREFIX Skipping preprocess (outputs present)\"\n"
+    . "  else\n"
+    . "    echo \"$ERROR_PREFIX ERROR: preprocess dir exists but looks incomplete: $dir\"; exit 1\n"
+    . "  fi\n"
+    . "else\n"
+    . "  echo \"$ERROR_PREFIX Running preprocess\"\n"
+    . "  $commands{preprocess}\n"
+    . "fi\n"
+    . "cd \"$dir\"\n\n";
+
+# stats
+print F "if tbi_ok \"$stats_prefix.per_base.gz\" && file_ok \"$stats_prefix.global_stats.txt\"; then\n"
+    . "  echo \"$ERROR_PREFIX Skipping stats (outputs present)\"\n"
+    . "else\n"
+    . "  echo \"$ERROR_PREFIX Running stats\"\n"
+    . "  $commands{stats}\n"
+    . "fi\n\n";
+
+# fcdrate (or cutoff)
+if ($options{fcdcut} == 0) {
+    print F "if file_ok \"$fcdrate_prefix.info.txt\"; then\n"
+        . "  echo \"$ERROR_PREFIX Skipping fcdrate (outputs present)\"\n"
+        . "  fcdcutoff=`tail -n 1 $fcdrate_prefix.info.txt | cut -f 1`\n"
+        . "else\n"
+        . "  echo \"$ERROR_PREFIX Running fcdrate\"\n"
+        . "  $commands{fcdrate}\n"
+        . "fi\n\n";
 }
+else {
+    print F "echo \"$ERROR_PREFIX Using user-provided FCD cutoff: $options{fcdcut}\"\n"
+        . "$commands{fcdrate}\n\n";
+}
+
+# score
+print F "if tbi_ok \"$score_prefix.per_base.gz\" && tbi_ok \"$score_prefix.errors.gff.gz\"; then\n"
+    . "  echo \"$ERROR_PREFIX Skipping score (outputs present)\"\n"
+    . "else\n"
+    . "  echo \"$ERROR_PREFIX Running score\"\n"
+    . "  $commands{score}\n"
+    . "fi\n\n";
+
+# break
+print F "if file_ok \"$break_prefix.broken_assembly.fa\"; then\n"
+    . "  echo \"$ERROR_PREFIX Skipping break (outputs present)\"\n"
+    . "else\n"
+    . "  echo \"$ERROR_PREFIX Running break\"\n"
+    . "  $commands{break}\n"
+    . "fi\n\n";
+
+# summary
+print F "if file_ok \"$summary_prefix.stats.tsv\" && file_ok \"$summary_prefix.report.txt\" && file_ok \"$summary_prefix.report.tsv\"; then\n"
+    . "  echo \"$ERROR_PREFIX Skipping summary (outputs present)\"\n"
+    . "else\n"
+    . "  echo \"$ERROR_PREFIX Running summary\"\n"
+    . "  $commands{summary}\n"
+    . "fi\n\n";
 
 close F;
 
@@ -132,4 +192,3 @@ sub hash_to_ops {
     $s =~ s/^\s+//;
     return $s;
 }
-
